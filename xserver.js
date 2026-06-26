@@ -100,9 +100,53 @@ async function login(page, username, password) {
   }
 
   await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+  await sleep(4000);
+}
+
+async function isLoginPage(page) {
+  if (page.url().includes('/login/')) return true;
+  return (await page.locator('#memberid, input[name="memberid"]').count().catch(() => 0)) > 0;
+}
+
+async function hasFreeVpsRow(page) {
+  return (await page.locator('tr:has(.freeServerIco)').count().catch(() => 0)) > 0;
+}
+
+async function pageSummary(page) {
+  const title = await page.title().catch(() => '');
+  const bodyText = await page.locator('body').textContent({ timeout: 10000 }).catch(() => '');
+  return {
+    url: page.url(),
+    title,
+    bodyText: bodyText.slice(0, 300).replace(/\s+/g, ' '),
+  };
 }
 
 async function ensureLoggedIn(page, account) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    await page.goto(VPS_INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(5000);
+
+    if (await hasFreeVpsRow(page)) return;
+
+    if (await isLoginPage(page)) {
+      await login(page, account.username, account.password);
+      if (await hasFreeVpsRow(page)) return;
+
+      await page.goto(VPS_INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await sleep(5000);
+      if (await hasFreeVpsRow(page)) return;
+    }
+
+    await sleep(4000);
+    if (await hasFreeVpsRow(page)) return;
+  }
+
+  const summary = await pageSummary(page);
+  throw new Error(
+    `XServer VPS page is not reachable after login. URL: ${summary.url}; title: ${summary.title}; snippet: ${summary.bodyText}`
+  );
+
   await page.goto(VPS_INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(1500);
 
@@ -118,8 +162,10 @@ async function ensureLoggedIn(page, account) {
 }
 
 async function getFreeVpsInfo(page) {
-  await page.goto(VPS_INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await sleep(2500);
+  if (!(await hasFreeVpsRow(page))) {
+    await page.goto(VPS_INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(6000);
+  }
 
   const info = await page.evaluate(() => {
     const row = document.querySelector('tr:has(.freeServerIco)');
