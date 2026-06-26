@@ -20,7 +20,7 @@ function safeName(value) {
 }
 
 function parseExpiry(text) {
-  const match = String(text || '').match(/(20\d{2})[-/](\d{1,2})[-/](\d{1,2})/);
+  const match = String(text || '').match(/(20\d{2})\s*(?:[-/年])\s*(\d{1,2})\s*(?:[-/月])\s*(\d{1,2})/);
   if (!match) {
     return {
       success: false,
@@ -109,7 +109,16 @@ async function isLoginPage(page) {
 }
 
 async function hasFreeVpsRow(page) {
-  return (await page.locator('tr:has(.freeServerIco)').count().catch(() => 0)) > 0;
+  return page.evaluate(() => {
+    return [...document.querySelectorAll('tr')].some((row) => {
+      const text = row.textContent || '';
+      return (
+        row.querySelector('.freeServerIco') ||
+        (text.includes('無料VPS') && row.querySelector('a[href*="/xapanel/xvps/server/detail"]')) ||
+        row.querySelector('a[href^="/xapanel/xvps/server/detail?id="]')
+      );
+    });
+  }).catch(() => false);
 }
 
 async function pageSummary(page) {
@@ -167,16 +176,7 @@ async function getFreeVpsInfo(page) {
     await sleep(6000);
   }
 
-  const info = await page.evaluate(() => {
-    const row = document.querySelector('tr:has(.freeServerIco)');
-    if (!row) return null;
-    const expiryText = row.querySelector('.contract__term')?.textContent?.trim() || '';
-    const detailHref =
-      row.querySelector('a[href^="/xapanel/xvps/server/detail?id="]')?.getAttribute('href') ||
-      row.querySelector('a[href*="/xapanel/xvps/server/detail"]')?.getAttribute('href') ||
-      '';
-    return { expiryText, detailHref };
-  });
+  let info = await extractFreeVpsFromPage(page);
 
   if (!info) {
     const title = await page.title().catch(() => '');
@@ -188,8 +188,62 @@ async function getFreeVpsInfo(page) {
     };
   }
 
+  if ((!info.expiryText || !parseExpiry(info.expiryText).success) && info.detailHref) {
+    const detailUrl = new URL(info.detailHref, VPS_INDEX_URL).href;
+    await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(2500);
+    info = {
+      ...info,
+      ...(await extractFreeVpsDetailFromPage(page)),
+    };
+  }
+
   const parsed = parseExpiry(info.expiryText);
   return { ...parsed, detailHref: info.detailHref };
+}
+
+async function extractFreeVpsFromPage(page) {
+  return page.evaluate(() => {
+    const rows = [...document.querySelectorAll('tr')];
+    const row = rows.find((candidate) => {
+      const text = candidate.textContent || '';
+      return (
+        candidate.querySelector('.freeServerIco') ||
+        (text.includes('無料VPS') && candidate.querySelector('a[href*="/xapanel/xvps/server/detail"]')) ||
+        candidate.querySelector('a[href^="/xapanel/xvps/server/detail?id="]')
+      );
+    });
+
+    if (!row) return null;
+
+    const detailHref =
+      row.querySelector('a[href^="/xapanel/xvps/server/detail?id="]')?.getAttribute('href') ||
+      row.querySelector('a[href*="/xapanel/xvps/server/detail"]')?.getAttribute('href') ||
+      '';
+
+    const explicitTerm = row.querySelector('.contract__term')?.textContent?.trim() || '';
+    const dateMatches = (row.textContent || '').match(/20\d{2}\s*(?:[-/年])\s*\d{1,2}\s*(?:[-/月])\s*\d{1,2}/g) || [];
+
+    return {
+      expiryText: explicitTerm || dateMatches[dateMatches.length - 1] || '',
+      detailHref,
+    };
+  }).catch(() => null);
+}
+
+async function extractFreeVpsDetailFromPage(page) {
+  return page.evaluate(() => {
+    const rows = [...document.querySelectorAll('tr')];
+    const limitRow = rows.find((row) => (row.textContent || '').includes('利用期限'));
+    const expiryText =
+      limitRow?.textContent?.match(/20\d{2}\s*(?:[-/年])\s*\d{1,2}\s*(?:[-/月])\s*\d{1,2}/)?.[0] ||
+      '';
+
+    return {
+      expiryText,
+      detailHref: location.href,
+    };
+  }).catch(() => ({ expiryText: '', detailHref: page.url() }));
 }
 
 async function solveCaptchaInPage(page) {
@@ -281,9 +335,28 @@ async function submitRenewalFinal(page) {
 async function renewFreeVps(page, info) {
   if (!info.detailHref) throw new Error('找不到免费 VPS 详情链接，无法进入续期页');
 
-  const renewUrl = new URL(info.detailHref, VPS_INDEX_URL).href.replace('detail?id', 'freevps/extend/index?id_vps');
-  await page.goto(renewUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const detailUrl = new URL(info.detailHref, VPS_INDEX_URL).href;
+  const renewUrl = detailUrl.replace('detail?id', 'freevps/extend/index?id_vps');
+
+  await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(2000);
+
+  const updateClicked = await clickFirst(page, [
+    'text=更新する',
+    'button:has-text("更新")',
+    'a:has-text("更新")',
+    'input[value*="更新"]',
+  ], 6000);
+
+  if (updateClicked) {
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+    await sleep(2000);
+  }
+
+  if (!page.url().includes('/freevps/extend/')) {
+    await page.goto(renewUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(2000);
+  }
 
   const confirmClicked = await clickFirst(page, [
     '[formaction="/xapanel/xvps/server/freevps/extend/conf"]',
