@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm_config_build_from_source=true npm ci --omit=dev
 RUN npx playwright install-deps chromium
 
 COPY . .
