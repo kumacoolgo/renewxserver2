@@ -1,13 +1,10 @@
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
 
 const DB_PATH = process.env.DB_PATH || '/data/accounts.db';
 
-const dbDir = path.dirname(DB_PATH);
-if (dbDir && dbDir !== '/') {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -18,24 +15,37 @@ db.serialize(() => {
       user_id INTEGER NOT NULL,
       username TEXT NOT NULL,
       password TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, username)
     )
   `);
+
   db.run(`
     CREATE TABLE IF NOT EXISTS check_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
       account_id INTEGER,
+      username TEXT,
+      success INTEGER NOT NULL DEFAULT 0,
+      action TEXT,
       expiry_date TEXT,
       days_left INTEGER,
+      message TEXT,
       checked_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  db.run('ALTER TABLE check_log ADD COLUMN username TEXT', () => {});
+  db.run('ALTER TABLE check_log ADD COLUMN success INTEGER NOT NULL DEFAULT 0', () => {});
+  db.run('ALTER TABLE check_log ADD COLUMN action TEXT', () => {});
+  db.run('ALTER TABLE check_log ADD COLUMN message TEXT', () => {});
+  db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_user_username ON accounts(user_id, username)');
 });
 
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
+    db.run(sql, params, function onRun(err) {
       if (err) reject(err);
       else resolve(this);
     });
@@ -52,25 +62,63 @@ function all(sql, params = []) {
 }
 
 async function addAccount(userId, username, password) {
-  return run(
-    'INSERT INTO accounts (user_id, username, password) VALUES (?, ?, ?)',
-    [userId, username, password]
-  );
+  const cleanUsername = username.trim();
+  const rows = await all('SELECT id FROM accounts WHERE user_id = ? AND username = ? LIMIT 1', [
+    userId,
+    cleanUsername,
+  ]);
+
+  if (rows[0]) {
+    return run(
+      'UPDATE accounts SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+      [password, rows[0].id, userId]
+    );
+  }
+
+  return run('INSERT INTO accounts (user_id, username, password) VALUES (?, ?, ?)', [
+    userId,
+    cleanUsername,
+    password,
+  ]);
 }
 
 async function getAccounts(userId) {
-  return all('SELECT * FROM accounts WHERE user_id = ?', [userId]);
+  return all('SELECT * FROM accounts WHERE user_id = ? ORDER BY id ASC', [userId]);
+}
+
+async function getAccount(userId, accountId) {
+  const rows = await all('SELECT * FROM accounts WHERE id = ? AND user_id = ?', [accountId, userId]);
+  return rows[0] || null;
 }
 
 async function deleteAccount(userId, accountId) {
   return run('DELETE FROM accounts WHERE id = ? AND user_id = ?', [accountId, userId]);
 }
 
-async function logCheck(userId, accountId, expiryDate, daysLeft) {
+async function logCheck(userId, account, result) {
   return run(
-    'INSERT INTO check_log (user_id, account_id, expiry_date, days_left) VALUES (?, ?, ?, ?)',
-    [userId, accountId, expiryDate, daysLeft]
+    `
+      INSERT INTO check_log
+        (user_id, account_id, username, success, action, expiry_date, days_left, message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      userId,
+      account?.id || null,
+      account?.username || null,
+      result.success ? 1 : 0,
+      result.action || 'check',
+      result.expiryDate || null,
+      Number.isFinite(result.daysLeft) ? result.daysLeft : null,
+      result.message || result.error || null,
+    ]
   );
 }
 
-module.exports = { addAccount, getAccounts, deleteAccount, logCheck };
+module.exports = {
+  addAccount,
+  getAccounts,
+  getAccount,
+  deleteAccount,
+  logCheck,
+};

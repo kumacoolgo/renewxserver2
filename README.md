@@ -1,63 +1,80 @@
 # renewxserver2
 
-Telegram bot for monitoring and renewing XServer VPS accounts.
+Telegram bot for XServer free VPS multi-account monitoring and automatic renewal.
+
+This version uses [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) instead of stock Playwright. Each XServer account gets its own persistent browser profile under `/data/profiles`, so cookies and browser identity can be reused across checks.
 
 ## Features
 
-- Add/remove XServer accounts via Telegram
-- Automatic expiry detection
-- Renewal reminder when ≤1 day remaining
-- Manual renewal flow with step-by-step guidance
+- Telegram bot account management
+- Multiple XServer accounts
+- Automatic XServer login and free VPS expiry detection
+- Automatic renewal when the remaining days are less than or equal to `RENEWAL_THRESHOLD_DAYS`
+- Japan-time scheduler: starts at 02:00, then runs every 4 hours
+- Telegram notification when automatic detection or renewal fails
+- Docker image ready for Zeabur deployment
 
-## Setup
+## Telegram Commands
 
-### Zeabur Deployment
+| Command | Description |
+| --- | --- |
+| `/start` | Show menu |
+| `/add` | Add or update an XServer account |
+| `/list` | List saved accounts |
+| `/check` | Check all accounts and renew when needed |
+| `/checkonly` | Check all accounts without renewal |
+| `/renew <id>` | Check and renew one account |
+| `/delete <id>` | Delete an account |
+| `/help` | Show help |
 
-1. Fork/clone this repository to GitHub
-2. On Zeabur:
-   - Create a new service
-   - Connect to GitHub and select this repo
-   - Add environment variables:
-     ```
-     TELEGRAM_BOT_TOKEN=your_bot_token
-     ADMIN_TELEGRAM_ID=your_numeric_user_id
-     ```
-   - Mount `/data` volume for SQLite database
-   - Deploy
+## Schedule
 
-### Local Development
+Automatic jobs run in Japan time at:
+
+`02:00`, `06:00`, `10:00`, `14:00`, `18:00`, `22:00`
+
+For every account, the job checks the free VPS expiry date. If renewal is needed, it renews first and then rechecks the expiry date. If renewal or detection fails, the Telegram admin receives a message.
+
+## Zeabur Deployment
+
+1. Push this repository to GitHub.
+2. Create a Zeabur service from the GitHub repo.
+3. Use Dockerfile deployment.
+4. Add a persistent volume mounted at `/data`.
+5. Add environment variables:
+
+```env
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+ADMIN_TELEGRAM_ID=your_numeric_telegram_user_id
+DB_PATH=/data/accounts.db
+DATA_DIR=/data
+PROFILE_DIR=/data/profiles
+CLOAKBROWSER_CACHE_DIR=/data/.cloakbrowser
+BROWSER_HEADLESS=true
+RENEWAL_THRESHOLD_DAYS=1
+RUN_ON_START=false
+```
+
+Optional CloakBrowser Pro:
+
+```env
+CLOAKBROWSER_LICENSE_KEY=cb_xxxxxxxx
+```
+
+The first run downloads the CloakBrowser Chromium binary into `CLOAKBROWSER_CACHE_DIR`. Keeping `/data` mounted avoids downloading it again after every redeploy.
+
+## Local Development
 
 ```bash
 npm install
-cp .env.example .env
-# Edit .env with your values
+npm run check
 npm start
 ```
 
-## Bot Commands
+On Windows with very new Node versions, `sqlite3` may require Visual Studio C++ Build Tools. Zeabur builds inside Linux with the Dockerfile, which installs the required build tools.
 
-| Command | Description |
-|---------|-------------|
-| `/start` | Show welcome message |
-| `/add` | Add new XServer account |
-| `/list` | List saved accounts |
-| `/delete <id>` | Delete an account |
-| `/check` | Check all accounts now |
-| `/renew <id>` | Get renewal link for account |
-| `/help` | Show help |
+## Notes
 
-## How It Works
-
-1. Add your XServer account via `/add`
-2. Bot checks expiry automatically (or use `/check`)
-3. When ≤1 day remaining, use `/renew <id>` to get the renewal link
-4. Complete manual verification on XServer website
-5. Click "I updated, recheck" button in bot
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | Your Telegram bot token from @BotFather |
-| `ADMIN_TELEGRAM_ID` | Yes | Your Telegram user ID (get via @userinfobot) |
-| `DB_PATH` | No | Path to SQLite database (default: /data/accounts.db) |
+- Credentials are stored in SQLite at `/data/accounts.db`; keep the Zeabur volume private.
+- If XServer changes its UI selectors or adds a new challenge flow, the bot sends a Telegram failure notification with the reason.
+- The CAPTCHA recognizer follows the original Tampermonkey flow and loads the model from `CAPTCHA_MODEL_URL`.

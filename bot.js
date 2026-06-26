@@ -1,411 +1,360 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { addAccount, getAccounts, deleteAccount, logCheck } = require('./db');
-const { loginAndCheckExpiry } = require('./xserver');
+const {
+  addAccount,
+  getAccounts,
+  getAccount,
+  deleteAccount,
+  logCheck,
+} = require('./db');
+const { checkAndRenewAccount } = require('./xserver');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? parseInt(process.env.ADMIN_TELEGRAM_ID) : null;
+const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null;
+const RUN_ON_START = process.env.RUN_ON_START === 'true';
 
 if (!TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN is required');
   process.exit(1);
 }
 
+if (!ADMIN_ID) {
+  console.error('ADMIN_TELEGRAM_ID is required');
+  process.exit(1);
+}
+
 const bot = new TelegramBot(TOKEN, { polling: true });
-
-// In-memory pending verification state
 const pendingActions = new Map();
+let autoJobRunning = false;
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-function isAdmin(userId) {
-  return ADMIN_ID && userId === ADMIN_ID;
+function isAdmin(chatId) {
+  return Number(chatId) === ADMIN_ID;
 }
 
-async function checkAllAccounts(userId) {
-  const accounts = await getAccounts(userId);
-  if (accounts.length === 0) {
-    return '没有保存任何账号。先用 /add 添加账号。';
-  }
-
-  const results = [];
-  for (const acc of accounts) {
-    const result = await loginAndCheckExpiry(acc.username, acc.password);
-    await logCheck(userId, acc.id, result.expiryDate || null, result.daysLeft || null);
-
-    if (result.success) {
-      const days = result.daysLeft;
-      let status = '';
-      if (days <= 1) {
-        status = `⚠️ 到期提醒：剩余 ${days} 天！需要续期！`;
-      } else if (days <= 7) {
-        status = `🟡 即将到期：剩余 ${days} 天`;
-      } else {
-        status = `✅ 正常：剩余 ${days} 天`;
-      }
-      results.push(`📦 ${acc.username}\n   ${status}\n   到期日: ${result.expiryDate}`);
-    } else {
-      results.push(`📦 ${acc.username}\n   ❌ 检查失败: ${result.error}`);
-    }
-  }
-  return results.join('\n\n');
+function requireAdmin(msg) {
+  if (isAdmin(msg.chat.id)) return true;
+  bot.sendMessage(msg.chat.id, '只有管理员可以使用这个机器人。');
+  return false;
 }
 
-// ─── Menu Keyboard ──────────────────────────────────────────────────────────
-
-function mainMenu() {
+function menu() {
   return {
     keyboard: [
-      ['📋 账号列表', '➕ 添加账号'],
-      ['🔄 立即检测', '❌ 删除账号'],
-      ['📘 帮助'],
+      ['账号列表', '添加账号'],
+      ['立即检测', '删除账号'],
+      ['帮助'],
     ],
     resize_keyboard: true,
   };
 }
 
-function inlineRenewMenu(accountId) {
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: '🔗 打开 XServer 登录页',
-          url: 'https://secure.xserver.ne.jp/xapanel/login/xvps/',
-        },
-      ],
-      [{ text: '✅ 我已更新，重新检查', callback_data: `recheck:${accountId}` }],
-    ],
-  };
+function escapeMarkdown(text) {
+  return String(text || '').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
-// ─── Command Handlers ─────────────────────────────────────────────────────────
+function formatResult(account, result) {
+  const name = escapeMarkdown(account.username);
+  if (result.success) {
+    if (result.action === 'renewed') {
+      return `✅ *${name}*\n自动续期成功\n${escapeMarkdown(result.previousExpiryDate)} \\-\\> ${escapeMarkdown(result.expiryDate)}`;
+    }
+
+    if (result.needsRenewal || result.action === 'needs_renewal') {
+      return `⚠️ *${name}*\n需要续期\n到期日: ${escapeMarkdown(result.expiryDate)}\n剩余: ${result.daysLeft} 天`;
+    }
+
+    return `✅ *${name}*\n无需续期\n到期日: ${escapeMarkdown(result.expiryDate)}\n剩余: ${result.daysLeft} 天`;
+  }
+
+  return `❌ *${name}*\n${escapeMarkdown(result.error || result.message || '检测失败')}`;
+}
+
+async function runAccount(account, { renew = true, notifyFailure = false } = {}) {
+  const result = await checkAndRenewAccount(account, { renew });
+  await logCheck(ADMIN_ID, account, result);
+
+  if (notifyFailure && !result.success) {
+    await bot.sendMessage(
+      ADMIN_ID,
+      `❌ 自动续期/检测失败\n\n账号: ${account.username}\n原因: ${result.error || result.message || '未知错误'}`,
+      { disable_web_page_preview: true }
+    );
+  }
+
+  if (notifyFailure && result.success && result.action === 'renewed') {
+    await bot.sendMessage(
+      ADMIN_ID,
+      `✅ 自动续期成功\n\n账号: ${account.username}\n${result.previousExpiryDate} -> ${result.expiryDate}`
+    );
+  }
+
+  return result;
+}
+
+async function checkAll({ renew = true, notifyFailure = false } = {}) {
+  const accounts = await getAccounts(ADMIN_ID);
+  if (!accounts.length) return [];
+
+  const results = [];
+  for (const account of accounts) {
+    const result = await runAccount(account, { renew, notifyFailure });
+    results.push({ account, result });
+  }
+  return results;
+}
+
+function nextJapanSlot(from = new Date()) {
+  const jstParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(from).reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+
+  const year = Number(jstParts.year);
+  const month = Number(jstParts.month);
+  const day = Number(jstParts.day);
+  const hour = Number(jstParts.hour) === 24 ? 0 : Number(jstParts.hour);
+  const minute = Number(jstParts.minute);
+  const second = Number(jstParts.second);
+  const slots = [2, 6, 10, 14, 18, 22];
+  const currentSeconds = hour * 3600 + minute * 60 + second;
+  const nextHour = slots.find((slot) => slot * 3600 > currentSeconds);
+  const targetJstMs = Date.UTC(year, month - 1, day + (nextHour == null ? 1 : 0), nextHour ?? 2, 0, 0);
+
+  // Convert the wall-clock JST target to UTC by subtracting 9 hours.
+  return new Date(targetJstMs - 9 * 3600 * 1000);
+}
+
+function scheduleNextAutoCheck() {
+  const next = nextJapanSlot();
+  const delay = Math.max(1000, next.getTime() - Date.now());
+  console.log(`Next auto check: ${next.toISOString()} (JST slot anchored at 02:00 every 4 hours)`);
+
+  setTimeout(async () => {
+    try {
+      if (autoJobRunning) return;
+      autoJobRunning = true;
+      await bot.sendMessage(ADMIN_ID, '⏱ 自动检测开始。');
+      const results = await checkAll({ renew: true, notifyFailure: true });
+      if (!results.length) {
+        await bot.sendMessage(ADMIN_ID, '自动检测完成：没有保存的账号。');
+      } else {
+        const lines = results.map(({ account, result }) => formatResult(account, result));
+        await bot.sendMessage(ADMIN_ID, `自动检测完成：\n\n${lines.join('\n\n')}`, { parse_mode: 'MarkdownV2' });
+      }
+    } catch (err) {
+      await bot.sendMessage(ADMIN_ID, `❌ 自动检测任务异常: ${err.message}`);
+    } finally {
+      autoJobRunning = false;
+      scheduleNextAutoCheck();
+    }
+  }, delay);
+}
 
 bot.onText(/\/start/, (msg) => {
-  const userId = msg.chat.id;
-
-  const text = `🤖 *XServer VPS 续期机器人*
-
-欢迎！此机器人帮你管理 XServer VPS 账号并检测到期时间。
-
-*功能：*
-• 添加/删除 XServer 账号
-• 自动检测利用期限
-• 临期提醒（≤1天）
-
-*快捷命令：*
-/start - 显示此菜单
-/add - 添加账号
-/list - 查看已保存账号
-/check - 立即检测期限
-/renew <id> - 获取续期入口
-/help - 帮助`;
-
-  bot.sendMessage(userId, text, {
-    parse_mode: 'Markdown',
-    reply_markup: mainMenu(),
-  });
+  if (!requireAdmin(msg)) return;
+  bot.sendMessage(
+    msg.chat.id,
+    [
+      '*renewxserver2*',
+      '',
+      'XServer 免费 VPS 自动检测和自动续期机器人。',
+      '每天日本时间 02:00 开始，每 4 小时自动检测一次。',
+      '',
+      '/add 添加账号',
+      '/list 查看账号',
+      '/check 立即检测并自动续期',
+      '/checkonly 只检测不续期',
+      '/delete <id> 删除账号',
+    ].join('\n'),
+    { parse_mode: 'Markdown', reply_markup: menu() }
+  );
 });
 
 bot.onText(/\/help/, (msg) => {
-  const userId = msg.chat.id;
-  bot.sendMessage(userId,
-    `*使用指南*\n\n` +
-    `1. /add - 输入用户名和密码保存账号\n` +
-    `2. /check - 立即检测所有账号到期时间\n` +
-    `3. 账号临期前1天会收到提醒\n` +
-    `4. 收到提醒后用 /renew <id> 获取续期入口\n` +
-    `5. 手动完成网站验证后点「我已更新，重新检查」`,
-    { parse_mode: 'Markdown', reply_markup: mainMenu() }
+  if (!requireAdmin(msg)) return;
+  bot.sendMessage(
+    msg.chat.id,
+    '命令：/add、/list、/check、/checkonly、/renew <id>、/delete <id>。自动任务会在日本时间 02:00 起每 4 小时运行。',
+    { reply_markup: menu() }
   );
 });
 
 bot.onText(/\/add/, (msg) => {
-  const userId = msg.chat.id;
-  if (!isAdmin(userId)) {
-    return bot.sendMessage(userId, '❌ 只有管理员可以使用此机器人');
-  }
-
-  pendingActions.set(userId, { action: 'waiting_username' });
-  bot.sendMessage(userId, '📝 请输入 XServer 用户名（邮箱）:', { reply_markup: { force_reply: true } });
+  if (!requireAdmin(msg)) return;
+  pendingActions.set(msg.chat.id, { action: 'waiting_username' });
+  bot.sendMessage(msg.chat.id, '请输入 XServer 登录账号：', { reply_markup: { force_reply: true } });
 });
 
+async function sendAccountList(chatId) {
+  const accounts = await getAccounts(ADMIN_ID);
+  if (!accounts.length) {
+    return bot.sendMessage(chatId, '还没有账号。使用 /add 添加。', { reply_markup: menu() });
+  }
+
+  const text = accounts
+    .map((account) => `ID ${account.id}: ${account.username}\n添加时间: ${account.created_at}`)
+    .join('\n\n');
+  return bot.sendMessage(chatId, text, { reply_markup: menu() });
+}
+
 bot.onText(/\/list/, async (msg) => {
-  const userId = msg.chat.id;
-  if (!isAdmin(userId)) {
-    return bot.sendMessage(userId, '❌ 只有管理员可以使用此机器人');
+  if (!requireAdmin(msg)) return;
+  return sendAccountList(msg.chat.id);
+});
+
+bot.onText(/\/delete\s+(\d+)/, async (msg, match) => {
+  if (!requireAdmin(msg)) return;
+  const result = await deleteAccount(ADMIN_ID, Number(match[1]));
+  bot.sendMessage(msg.chat.id, result.changes ? '账号已删除。' : '没有找到这个账号。', { reply_markup: menu() });
+});
+
+bot.onText(/\/check$/, async (msg) => {
+  if (!requireAdmin(msg)) return;
+  const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号，需要续期时会自动续期...');
+  try {
+    const results = await checkAll({ renew: true, notifyFailure: true });
+    const text = results.length
+      ? results.map(({ account, result }) => formatResult(account, result)).join('\n\n')
+      : '还没有账号。使用 /add 添加。';
+    await bot.editMessageText(text, {
+      chat_id: msg.chat.id,
+      message_id: sent.message_id,
+      parse_mode: 'MarkdownV2',
+    });
+  } catch (err) {
+    await bot.editMessageText(`检测失败: ${err.message}`, {
+      chat_id: msg.chat.id,
+      message_id: sent.message_id,
+    });
   }
+});
 
-  const accounts = await getAccounts(userId);
-  if (accounts.length === 0) {
-    return bot.sendMessage(userId, '没有保存任何账号。用 /add 添加。', { reply_markup: mainMenu() });
+bot.onText(/\/checkonly$/, async (msg) => {
+  if (!requireAdmin(msg)) return;
+  const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号，不会执行续期...');
+  try {
+    const results = await checkAll({ renew: false, notifyFailure: false });
+    const text = results.length
+      ? results.map(({ account, result }) => formatResult(account, result)).join('\n\n')
+      : '还没有账号。使用 /add 添加。';
+    await bot.editMessageText(text, {
+      chat_id: msg.chat.id,
+      message_id: sent.message_id,
+      parse_mode: 'MarkdownV2',
+    });
+  } catch (err) {
+    await bot.editMessageText(`检测失败: ${err.message}`, {
+      chat_id: msg.chat.id,
+      message_id: sent.message_id,
+    });
   }
+});
 
-  const list = accounts.map((acc) =>
-    `• *${acc.username}* (ID: ${acc.id})\n  添加于 ${acc.created_at}`
-  ).join('\n\n');
+bot.onText(/\/renew\s+(\d+)/, async (msg, match) => {
+  if (!requireAdmin(msg)) return;
+  const account = await getAccount(ADMIN_ID, Number(match[1]));
+  if (!account) return bot.sendMessage(msg.chat.id, '没有找到这个账号。', { reply_markup: menu() });
 
-  bot.sendMessage(userId, `*已保存账号 (${accounts.length}):*\n\n${list}`, {
-    parse_mode: 'Markdown',
-    reply_markup: mainMenu(),
+  const sent = await bot.sendMessage(msg.chat.id, `正在检测并自动续期: ${account.username}`);
+  const result = await runAccount(account, { renew: true, notifyFailure: true });
+  await bot.editMessageText(formatResult(account, result), {
+    chat_id: msg.chat.id,
+    message_id: sent.message_id,
+    parse_mode: 'MarkdownV2',
   });
 });
 
-bot.onText(/\/delete (\d+)/, async (msg, match) => {
-  const userId = msg.chat.id;
-  if (!isAdmin(userId)) {
-    return bot.sendMessage(userId, '❌ 只有管理员可以使用此机器人');
-  }
-
-  const accountId = parseInt(match[1]);
-  const result = await deleteAccount(userId, accountId);
-  if (result.changes > 0) {
-    bot.sendMessage(userId, '✅ 账号已删除。', { reply_markup: mainMenu() });
-  } else {
-    bot.sendMessage(userId, '❌ 未找到该账号。', { reply_markup: mainMenu() });
-  }
-});
-
-bot.onText(/\/check/, async (msg) => {
-  const userId = msg.chat.id;
-  if (!isAdmin(userId)) {
-    return bot.sendMessage(userId, '❌ 只有管理员可以使用此机器人');
-  }
-
-  const sentMsg = await bot.sendMessage(userId, '🔄 正在检测所有账号，请稍候...');
-
-  try {
-    const result = await checkAllAccounts(userId);
-    bot.editMessageText(result, {
-      chat_id: userId,
-      message_id: sentMsg.message_id,
-      parse_mode: 'Markdown',
-    });
-  } catch (err) {
-    bot.editMessageText(`❌ 检测失败: ${err.message}`, {
-      chat_id: userId,
-      message_id: sentMsg.message_id,
-    });
-  }
-});
-
-// ─── Inline Button Handlers ───────────────────────────────────────────────────
-
 bot.on('message', async (msg) => {
-  const userId = msg.chat.id;
-  const text = msg.text;
+  if (!isAdmin(msg.chat.id) || !msg.text || msg.text.startsWith('/')) return;
 
-  if (!text || text.startsWith('/')) return;
-  if (!isAdmin(userId)) return;
-
-  // Handle menu button inputs (use text.includes to avoid emoji mismatch)
-  if (text.includes('账号列表')) {
-    const accounts = await getAccounts(userId);
-    if (accounts.length === 0) {
-      return bot.sendMessage(userId, '没有保存任何账号。用 /add 添加。', {
-        reply_markup: mainMenu(),
-      });
-    }
-
-    const list = accounts.map((acc) =>
-      `• *${acc.username}* (ID: ${acc.id})\n  添加于 ${acc.created_at}`
-    ).join('\n\n');
-
-    return bot.sendMessage(userId, `*已保存账号 (${accounts.length}):*\n\n${list}`, {
-      parse_mode: 'Markdown',
-      reply_markup: mainMenu(),
-    });
+  const text = msg.text.trim();
+  if (text === '账号列表') return sendAccountList(msg.chat.id);
+  if (text === '添加账号') {
+    pendingActions.set(msg.chat.id, { action: 'waiting_username' });
+    return bot.sendMessage(msg.chat.id, '请输入 XServer 登录账号：', { reply_markup: { force_reply: true } });
   }
-
-  if (text.includes('添加账号')) {
-    pendingActions.set(userId, { action: 'waiting_username' });
-    return bot.sendMessage(userId, '📝 请输入 XServer 用户名（邮箱）:', {
-      reply_markup: { force_reply: true },
-    });
-  }
-
-  if (text.includes('立即检测')) {
-    const sentMsg = await bot.sendMessage(userId, '🔄 正在检测所有账号，请稍候...');
-
+  if (text === '立即检测') {
+    const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号，需要续期时会自动续期...');
     try {
-      const result = await checkAllAccounts(userId);
-      return bot.editMessageText(result, {
-        chat_id: userId,
-        message_id: sentMsg.message_id,
-        parse_mode: 'Markdown',
+      const results = await checkAll({ renew: true, notifyFailure: true });
+      const reply = results.length
+        ? results.map(({ account, result }) => formatResult(account, result)).join('\n\n')
+        : '还没有账号。使用 /add 添加。';
+      return bot.editMessageText(reply, {
+        chat_id: msg.chat.id,
+        message_id: sent.message_id,
+        parse_mode: 'MarkdownV2',
       });
     } catch (err) {
-      return bot.editMessageText(`❌ 检测失败: ${err.message}`, {
-        chat_id: userId,
-        message_id: sentMsg.message_id,
+      return bot.editMessageText(`检测失败: ${err.message}`, {
+        chat_id: msg.chat.id,
+        message_id: sent.message_id,
       });
     }
   }
-
-  if (text.includes('帮助')) {
-    return bot.sendMessage(userId,
-      `*使用指南*\n\n` +
-      `1. 添加账号 - 输入用户名和密码保存账号\n` +
-      `2. 立即检测 - 检测所有账号到期时间\n` +
-      `3. 账号临期前1天会收到提醒\n` +
-      `4. 收到提醒后用 /renew <id> 获取续期入口\n` +
-      `5. 手动完成网站验证后点「我已更新，重新检查」`,
-      { parse_mode: 'Markdown', reply_markup: mainMenu() }
+  if (text === '帮助') {
+    return bot.sendMessage(
+      msg.chat.id,
+      '命令：/add、/list、/check、/checkonly、/renew <id>、/delete <id>。自动任务会在日本时间 02:00 起每 4 小时运行。',
+      { reply_markup: menu() }
     );
   }
 
-  if (text.includes('删除账号')) {
-    const accounts = await getAccounts(userId);
-    if (accounts.length === 0) {
-      return bot.sendMessage(userId, '没有账号可删除。', { reply_markup: mainMenu() });
-    }
-    const list = accounts.map((acc) => `• ${acc.username} (ID: ${acc.id})`).join('\n');
-    pendingActions.set(userId, { action: 'waiting_delete_id' });
-    return bot.sendMessage(userId, `请回复要删除的账号 ID：\n\n${list}`, { reply_markup: { force_reply: true } });
+  if (text === '删除账号') {
+    const accounts = await getAccounts(ADMIN_ID);
+    if (!accounts.length) return bot.sendMessage(msg.chat.id, '还没有账号。', { reply_markup: menu() });
+    pendingActions.set(msg.chat.id, { action: 'waiting_delete_id' });
+    return bot.sendMessage(
+      msg.chat.id,
+      `请输入要删除的账号 ID：\n\n${accounts.map((a) => `${a.id}: ${a.username}`).join('\n')}`,
+      { reply_markup: { force_reply: true } }
+    );
   }
 
-  const state = pendingActions.get(userId);
+  const state = pendingActions.get(msg.chat.id);
   if (!state) return;
 
   if (state.action === 'waiting_username') {
     state.username = text;
     state.action = 'waiting_password';
-    bot.sendMessage(userId, '🔐 请输入密码:', { reply_markup: { force_reply: true } });
-  } else if (state.action === 'waiting_password') {
-    const username = state.username;
-    const password = text;
-    pendingActions.delete(userId);
+    return bot.sendMessage(msg.chat.id, '请输入 XServer 登录密码：', { reply_markup: { force_reply: true } });
+  }
 
-    try {
-      await addAccount(userId, username, password);
-      bot.sendMessage(userId, `✅ 账号已保存: ${username}`, { reply_markup: mainMenu() });
-    } catch (err) {
-      bot.sendMessage(userId, `❌ 保存失败: ${err.message}`);
-    }
-  } else if (state.action === 'waiting_delete_id') {
-    const accountId = parseInt(text.trim());
-    pendingActions.delete(userId);
+  if (state.action === 'waiting_password') {
+    pendingActions.delete(msg.chat.id);
+    await addAccount(ADMIN_ID, state.username, text);
+    return bot.sendMessage(msg.chat.id, `账号已保存: ${state.username}`, { reply_markup: menu() });
+  }
 
-    if (!Number.isInteger(accountId)) {
-      return bot.sendMessage(userId, '❌ ID 格式不正确', { reply_markup: mainMenu() });
-    }
-
-    const result = await deleteAccount(userId, accountId);
-    if (result.changes > 0) {
-      return bot.sendMessage(userId, '✅ 账号已删除。', { reply_markup: mainMenu() });
-    }
-    return bot.sendMessage(userId, '❌ 未找到该账号。', { reply_markup: mainMenu() });
+  if (state.action === 'waiting_delete_id') {
+    pendingActions.delete(msg.chat.id);
+    const id = Number(text);
+    if (!Number.isInteger(id)) return bot.sendMessage(msg.chat.id, '请输入数字 ID。', { reply_markup: menu() });
+    const result = await deleteAccount(ADMIN_ID, id);
+    return bot.sendMessage(msg.chat.id, result.changes ? '账号已删除。' : '没有找到这个账号。', { reply_markup: menu() });
   }
 });
-
-// /renew <id> - get renewal link
-bot.onText(/\/renew (\d+)/, async (msg, match) => {
-  const userId = msg.chat.id;
-  if (!isAdmin(userId)) {
-    return bot.sendMessage(userId, '❌ 只有管理员可以使用此机器人');
-  }
-
-  const accountId = parseInt(match[1]);
-  const accounts = await getAccounts(userId);
-  const account = accounts.find(a => a.id === accountId);
-
-  if (!account) {
-    return bot.sendMessage(userId, '❌ 未找到该账号。', { reply_markup: mainMenu() });
-  }
-
-  bot.sendMessage(userId,
-    `📦 账号: *${account.username}*\n\n` +
-    `请按以下步骤手动续期:\n\n` +
-    `1. 点击「打开 XServer 登录页」\n` +
-    `2. 登录后进入 VPS 首页\n` +
-    `3. 点击「契約情報」\n` +
-    `4. 点击「更新する」\n` +
-    `5. 点击「引き続き無料VPSの利用を継続する」\n` +
-    `6. 输入数字验证码\n` +
-    `7. 如有 Cloudflare 验证请手动完成\n` +
-    `8. 点击「無料VPSの利用を継続する」\n` +
-    `9. 完成后返回此机器人点「我已更新，重新检查」`,
-    {
-      parse_mode: 'Markdown',
-      reply_markup: inlineRenewMenu(accountId),
-    }
-  );
-});
-
-// Callback for recheck button
-bot.on('callback_query', async (query) => {
-  const userId = query.message.chat.id;
-  const data = query.data;
-
-  if (!data.startsWith('recheck:')) return;
-
-  const accountId = parseInt(data.split(':')[1]);
-  const accounts = await getAccounts(userId);
-  const account = accounts.find(a => a.id === accountId);
-
-  if (!account) {
-    bot.answerCallbackQuery(query.id, { text: '❌ 未找到账号' });
-    return;
-  }
-
-  bot.answerCallbackQuery(query.id, { text: '🔄 正在重新检测...' });
-
-  const result = await loginAndCheckExpiry(account.username, account.password);
-  await logCheck(userId, account.id, result.expiryDate || null, result.daysLeft || null);
-
-  let msgText;
-  if (result.success) {
-    if (result.needsRenewal) {
-      msgText = `⚠️ *${account.username}*\n仍需续期！剩余 *${result.daysLeft} 天*\n到期日: ${result.expiryDate}\n\n请继续手动续期流程。`;
-    } else {
-      msgText = `🎉 *${account.username}*\n✅ 续期成功！剩余 *${result.daysLeft} 天*\n到期日: ${result.expiryDate}`;
-    }
-  } else {
-    msgText = `❌ *${account.username}*\n检查失败: ${result.error}`;
-  }
-
-  bot.editMessageText(msgText, {
-    chat_id: userId,
-    message_id: query.message.message_id,
-    parse_mode: 'Markdown',
-  });
-});
-
-// ─── Error Handling ───────────────────────────────────────────────────────────
 
 bot.on('polling_error', (err) => {
-  console.error('Polling error:', err.message);
+  console.error('Telegram polling error:', err.message);
 });
 
-// ─── Auto-check Timer ─────────────────────────────────────────────────────────
+scheduleNextAutoCheck();
 
-async function autoCheckAndRemind() {
-  if (!ADMIN_ID) return;
-
-  const accounts = await getAccounts(ADMIN_ID);
-  if (accounts.length === 0) return;
-
-  for (const acc of accounts) {
-    try {
-      const result = await loginAndCheckExpiry(acc.username, acc.password);
-      await logCheck(ADMIN_ID, acc.id, result.expiryDate || null, result.daysLeft || null);
-
-      if (result.success && result.daysLeft <= 1) {
-        await bot.sendMessage(
-          ADMIN_ID,
-          `⚠️ *XServer VPS 到期提醒*\n\n账号: *${acc.username}*\n到期日: *${result.expiryDate}*\n剩余: *${result.daysLeft} 天*\n\n请尽快续期。`,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: inlineRenewMenu(acc.id),
-          }
-        );
-      }
-    } catch (e) {
-      console.error(`Auto-check failed for ${acc.username}: ${e.message}`);
-    }
-  }
+if (RUN_ON_START) {
+  setTimeout(() => {
+    checkAll({ renew: true, notifyFailure: true }).catch((err) => {
+      console.error('Startup check failed:', err);
+    });
+  }, 15000);
 }
 
-// Run first check 30s after startup, then every 6 hours
-setTimeout(autoCheckAndRemind, 30 * 1000);
-setInterval(autoCheckAndRemind, 6 * 60 * 60 * 1000);
-
-console.log('✅ XServer Renew Bot started');
+console.log('renewxserver2 bot started');
