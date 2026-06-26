@@ -1,4 +1,4 @@
-# renewxserver
+# renewxserver2
 
 Telegram bot for monitoring and renewing XServer VPS accounts.
 
