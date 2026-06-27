@@ -14,9 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     g++ \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fonts-noto-cjk \
     make \
     python3 \
     tini \
+    xauth \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 
