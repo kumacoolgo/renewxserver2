@@ -50,7 +50,7 @@ DB_PATH=/data/accounts.db
 DATA_DIR=/data
 PROFILE_DIR=/data/profiles
 CLOAKBROWSER_CACHE_DIR=/data/.cloakbrowser
-BROWSER_HEADLESS=true
+BROWSER_HEADLESS=false
 RENEWAL_THRESHOLD_DAYS=1
 RUN_ON_START=false
 ```
@@ -61,7 +61,7 @@ Optional CloakBrowser Pro:
 CLOAKBROWSER_LICENSE_KEY=cb_xxxxxxxx
 ```
 
-The first run downloads the CloakBrowser Chromium binary into `CLOAKBROWSER_CACHE_DIR`. Keeping `/data` mounted avoids downloading it again after every redeploy.
+The Docker image runs CloakBrowser in headed mode through Xvfb because Cloudflare Turnstile is much less reliable in pure headless mode. The first run downloads the CloakBrowser Chromium binary into `CLOAKBROWSER_CACHE_DIR`. Keeping `/data` mounted avoids downloading it again after every redeploy.
 
 ## Local Development
 

@@ -304,9 +304,13 @@ async function waitForTurnstile(page, timeoutMs = 90000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const status = await page.evaluate(() => {
-      const field = document.querySelector('[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-      if (!field) return 'missing';
-      return field.value ? 'ready' : 'waiting';
+      const fields = [...document.querySelectorAll('[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')];
+      const submit = document.querySelector('#submit_button, [formaction="/xapanel/xvps/server/freevps/extend/do"]');
+      const hasToken = fields.some((field) => String(field.value || '').trim().length > 0);
+      const submitEnabled = submit && !submit.disabled && !submit.classList.contains('btn--disabled');
+
+      if (!fields.length) return 'missing';
+      return hasToken || submitEnabled ? 'ready' : 'waiting';
     }).catch(() => 'missing');
 
     if (status === 'missing' || status === 'ready') return status;

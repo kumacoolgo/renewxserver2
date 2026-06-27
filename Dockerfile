@@ -7,7 +7,8 @@ ENV NODE_ENV=production \
     DB_PATH=/data/accounts.db \
     PROFILE_DIR=/data/profiles \
     CLOAKBROWSER_CACHE_DIR=/data/.cloakbrowser \
-    BROWSER_HEADLESS=true
+    BROWSER_HEADLESS=false \
+    DISPLAY=:99
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -28,4 +29,4 @@ RUN npm run check
 
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "bot.js"]
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1366x900x24", "node", "bot.js"]
