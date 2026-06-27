@@ -12,10 +12,6 @@ const BROWSER_GEOIP =
   process.env.BROWSER_GEOIP == null ? Boolean(BROWSER_PROXY) : process.env.BROWSER_GEOIP === 'true';
 const BROWSER_TIMEZONE = process.env.BROWSER_TIMEZONE || 'Asia/Tokyo';
 const BROWSER_LOCALE = process.env.BROWSER_LOCALE || 'ja-JP';
-const CAPTCHA_MODEL_URL =
-  process.env.CAPTCHA_MODEL_URL ||
-  'https://github30.github.io/captcha-cloudrun/web_model/model.json?v=20260407-2';
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -272,393 +268,32 @@ async function extractFreeVpsDetailFromPage(page) {
   }).catch(() => ({ expiryText: '', detailHref: page.url() }));
 }
 
-async function solveCaptchaInPage(page) {
-  return page.evaluate(async (modelUrl) => {
-    function setNativeValue(input, value) {
-      input.focus();
-      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value');
-      if (descriptor && descriptor.set) {
-        descriptor.set.call(input, value);
-      } else {
-        input.value = value;
-      }
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-    }
-
-    function loadScript(src) {
-      return new Promise((resolve, reject) => {
-        if (window.tf) return resolve();
-        const script = document.createElement('script');
-        script.src = src;
-        script.onload = resolve;
-        script.onerror = () => reject(new Error(`加载脚本失败: ${src}`));
-        document.head.appendChild(script);
-      });
-    }
-
-    function decodeCaptcha(predictionTensor) {
-      const blankIndex = predictionTensor.shape[2] - 1;
-      const bestPath = predictionTensor.argMax(-1).dataSync();
-      const digits = [];
-      let previous = blankIndex;
-
-      for (const index of bestPath) {
-        if (index !== blankIndex && index !== previous) digits.push(String(index));
-        previous = index;
-      }
-      return digits.join('');
-    }
-
-    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
-    await window.tf.ready();
-
-    const img = document.querySelector('img[src^="data:image"], img[src^="data:"]');
-    if (!img) throw new Error('找不到验证码图片');
-
-    const model = await window.tf.loadLayersModel(modelUrl);
-    const code = window.tf.tidy(() => {
-      const tensor = window.tf.browser
-        .fromPixels(img)
-        .resizeBilinear([60, 300])
-        .toFloat()
-        .div(255)
-        .expandDims(0);
-      return decodeCaptcha(model.predict(tensor));
-    });
-
-    const input =
-      document.querySelector('[placeholder*="上の画像"]') ||
-      document.querySelector('input[name*="captcha"], input[placeholder*="画像"], input[type="text"]');
-    if (!input) throw new Error('找不到验证码输入框');
-
-    setNativeValue(input, code);
-    return code;
-  }, CAPTCHA_MODEL_URL);
-}
-
-async function clickTurnstileIfPresent(page) {
-  const frameSelectors = [
-    'iframe[src*="turnstile"]',
-    'iframe[title*="Cloudflare"]',
-    'iframe[title*="Widget"]',
-    'iframe[src*="challenges.cloudflare.com"]',
-  ];
-  const controlSelectors = [
-    'input[type="checkbox"]',
-    '[role="checkbox"]',
-    'label',
-    '.ctp-checkbox-label',
-    '#challenge-stage',
-    'body',
-  ];
-
-  for (const frameSelector of frameSelectors) {
-    const frameLocator = page.frameLocator(frameSelector);
-    for (const controlSelector of controlSelectors) {
-      try {
-        const control = frameLocator.locator(controlSelector).first();
-        if (!(await control.count().catch(() => 0))) continue;
-        await control.click({ timeout: 2500 });
-        return true;
-      } catch (_) {
-        // Try the next Turnstile target.
-      }
-    }
-
-    try {
-      const iframe = page.locator(frameSelector).first();
-      if (!(await iframe.count().catch(() => 0))) continue;
-      const box = await iframe.boundingBox();
-      if (!box) continue;
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-      return true;
-    } catch (_) {
-      // Try the next iframe candidate.
-    }
-  }
-
-  return false;
-}
-
-async function waitForTurnstile(page, timeoutMs = 90000) {
-  const started = Date.now();
-  let lastClickAt = 0;
-  while (Date.now() - started < timeoutMs) {
-    const status = await page.evaluate(() => {
-      const fields = [...document.querySelectorAll('[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')];
-      const submit = document.querySelector('#submit_button, [formaction="/xapanel/xvps/server/freevps/extend/do"]');
-      const hasToken = fields.some((field) => String(field.value || '').trim().length > 0);
-      const submitEnabled = submit && !submit.disabled && !submit.classList.contains('btn--disabled');
-
-      if (!fields.length && submitEnabled) return 'missing';
-      return hasToken ? 'ready' : 'waiting';
-    }).catch(() => 'missing');
-
-    if (status === 'missing' || status === 'ready') return status;
-    if (Date.now() - lastClickAt > 5000) {
-      await clickTurnstileIfPresent(page);
-      lastClickAt = Date.now();
-    }
-    await sleep(1000);
-  }
-  throw new Error('Cloudflare Turnstile 未在超时时间内完成');
-}
-
-async function getFinalSubmitState(page) {
-  return page.evaluate(() => {
-    const submit = document.querySelector('#submit_button, [formaction="/xapanel/xvps/server/freevps/extend/do"]');
-    const captchaInput = document.querySelector('[placeholder*="上の画像"], input[name*="captcha"], input[type="text"]');
-    const fields = [...document.querySelectorAll('[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')];
-    const turnstileFrames = document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]').length;
-    const tokenLengths = fields.map((field) => String(field.value || '').trim().length);
-
-    return {
-      exists: Boolean(submit),
-      disabled: submit ? Boolean(submit.disabled) : null,
-      className: submit ? String(submit.className || '') : '',
-      text: submit ? String(submit.textContent || submit.value || '').trim() : '',
-      captchaLength: captchaInput ? String(captchaInput.value || '').trim().length : null,
-      tokenLengths,
-      turnstileFrames,
-      url: location.href,
-    };
-  }).catch((err) => ({ error: err.message }));
-}
-
-async function waitForFinalSubmitReady(page, timeoutMs = 30000) {
-  const started = Date.now();
-  let lastClickAt = 0;
-
-  while (Date.now() - started < timeoutMs) {
-    const state = await getFinalSubmitState(page);
-    const enabled =
-      state.exists &&
-      !state.disabled &&
-      !String(state.className || '').includes('btn--disabled') &&
-      !String(state.className || '').includes('disabled');
-
-    if (enabled) return state;
-
-    if (Date.now() - lastClickAt > 5000) {
-      await clickTurnstileIfPresent(page);
-      lastClickAt = Date.now();
-    }
-    await sleep(1000);
-  }
-
-  const state = await getFinalSubmitState(page);
-  throw new Error(`最终续期提交按钮不可点击: ${JSON.stringify(state)}`);
-}
-
-async function clickFinalSubmitInPage(page) {
-  return page.evaluate(() => {
-    const submitBtn =
-      [...document.querySelectorAll('button, input[type="submit"], a')].find((el) =>
-        String(el.textContent || el.value || '').includes('無料VPSの利用を継続する')
-      ) ||
-      document.querySelector('[formaction="/xapanel/xvps/server/freevps/extend/do"]') ||
-      document.querySelector('#submit_button') ||
-      document.querySelector('input[type="submit"], button[type="submit"]');
-
-    if (!submitBtn) {
-      return {
-        clicked: false,
-        reason: '找不到提交按钮',
-        url: location.href,
-        text: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
-      };
-    }
-
-    if (submitBtn.disabled || String(submitBtn.className || '').includes('btn--disabled')) {
-      return {
-        clicked: false,
-        reason: '提交按钮不可点击',
-        disabled: Boolean(submitBtn.disabled),
-        className: String(submitBtn.className || ''),
-        url: location.href,
-      };
-    }
-
-    submitBtn.click();
-    return {
-      clicked: true,
-      text: String(submitBtn.textContent || submitBtn.value || '').trim(),
-      url: location.href,
-    };
-  });
-}
-
-async function submitRenewalFinal(page) {
-  await waitForTurnstile(page);
-  await waitForFinalSubmitReady(page);
-  await sleep(1000);
-  const clickResult = await clickFinalSubmitInPage(page);
-
-  if (!clickResult.clicked) {
-    throw new Error(`找不到最终续期提交按钮: ${JSON.stringify(clickResult)}`);
-  }
-
-  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-  await sleep(3000);
-
-  const problem = await getRenewalSubmitProblem(page);
-  if (problem) throw new Error(problem);
-}
-
-async function getRenewalSubmitProblem(page) {
-  return page.evaluate(() => {
-    const isVerificationPage =
-      location.pathname.includes('/xapanel/xvps/server/freevps/extend/conf') ||
-      location.pathname.includes('/xapanel/xvps/server/freevps/extend/do');
-    if (!isVerificationPage) return '';
-
-    const captchaImage = document.querySelector('img[src^="data:image"], img[src^="data:"]');
-    const captchaInput = document.querySelector('[placeholder*="上の画像"], input[name*="captcha"], input[type="text"]');
-    const submit = document.querySelector('#submit_button, [formaction="/xapanel/xvps/server/freevps/extend/do"]');
-    if (!captchaImage || !captchaInput || !submit) return '';
-
-    const bodyText = (document.body?.textContent || '').replace(/\s+/g, ' ').trim();
-    return `续期提交后仍停留在验证码页面，可能是验证码或 Turnstile 未通过。URL: ${location.href}; 页面: ${bodyText.slice(0, 260)}`;
-  }).catch(() => '');
-}
-
-async function solveCaptchaAndSubmitRenewal(page) {
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const hasCaptcha = await page.locator('img[src^="data:image"], img[src^="data:"]').count().catch(() => 0);
-      if (hasCaptcha > 0) {
-        let solved = false;
-        for (let i = 0; i < 3; i += 1) {
-          try {
-            const code = await solveCaptchaInPage(page);
-            if (!code || String(code).length < 4) throw new Error(`验证码识别结果异常: ${code || '(empty)'}`);
-            solved = true;
-            break;
-          } catch (err) {
-            lastError = err;
-            await sleep(1000);
-          }
-        }
-        if (!solved) throw lastError || new Error('验证码识别失败');
-      }
-
-      await submitRenewalFinal(page);
-      return;
-    } catch (err) {
-      lastError = err;
-      const canRetry =
-        String(err.message || '').includes('验证码') ||
-        String(err.message || '').includes('Turnstile');
-      if (!canRetry || attempt >= 3) throw err;
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await sleep(3000);
-    }
-  }
-
-  throw lastError || new Error('续期提交失败');
-}
-
-async function renewFreeVps(page, info) {
-  if (!info.detailHref) throw new Error('找不到免费 VPS 详情链接，无法进入续期页');
-
-  const detailUrl = new URL(info.detailHref, VPS_INDEX_URL).href;
-  const renewUrl = detailUrl.replace('detail?id', 'freevps/extend/index?id_vps');
-
-  await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await sleep(2000);
-
-  const updateClicked = await clickFirst(page, [
-    'text=更新する',
-    'button:has-text("更新")',
-    'a:has-text("更新")',
-    'input[value*="更新"]',
-  ], 6000);
-
-  if (updateClicked) {
-    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-    await sleep(2000);
-  }
-
-  if (!page.url().includes('/freevps/extend/')) {
-    await page.goto(renewUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(2000);
-  }
-
-  const confirmClicked = await clickFirst(page, [
-    '[formaction="/xapanel/xvps/server/freevps/extend/conf"]',
-    'button:has-text("確認")',
-    'input[type="submit"]',
-    'button[type="submit"]',
-  ]);
-
-  if (!confirmClicked) throw new Error('找不到续期确认按钮');
-
-  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-  await sleep(2500);
-
-  await solveCaptchaAndSubmitRenewal(page);
-}
-
-async function checkAndRenewAccount(account, options = {}) {
+async function checkAccount(account) {
   const context = await launchAccountContext(account);
   const page = context.pages()[0] || await context.newPage();
 
   try {
     await ensureLoggedIn(page, account);
-    const before = await getFreeVpsInfo(page);
-    if (!before.success) return before;
+    const result = await getFreeVpsInfo(page);
+    if (!result.success) return result;
 
-    if (!before.needsRenewal) {
+    if (result.needsRenewal) {
       return {
-        ...before,
-        action: 'check',
-        message: `无需续期。到期日 ${before.expiryDate}, 剩余 ${before.daysLeft} 天`,
-      };
-    }
-
-    if (options.renew === false) {
-      return {
-        ...before,
+        ...result,
         action: 'needs_renewal',
-        message: `需要续期。到期日 ${before.expiryDate}, 剩余 ${before.daysLeft} 天`,
-      };
-    }
-
-    await renewFreeVps(page, before);
-    const after = await getFreeVpsInfo(page);
-
-    if (!after.success) {
-      return {
-        ...after,
-        action: 'renew_failed',
-        error: `续期后复查失败: ${after.error}`,
-      };
-    }
-
-    if (after.expiryDate === before.expiryDate || after.needsRenewal) {
-      return {
-        success: false,
-        action: 'renew_failed',
-        expiryDate: after.expiryDate,
-        daysLeft: after.daysLeft,
-        error: `自动续期后到期日未更新。续期前 ${before.expiryDate}, 续期后 ${after.expiryDate}`,
+        message: `需要手动更新。到期日 ${result.expiryDate}, 剩余 ${result.daysLeft} 天`,
       };
     }
 
     return {
-      ...after,
-      action: 'renewed',
-      previousExpiryDate: before.expiryDate,
-      message: `自动续期成功: ${before.expiryDate} -> ${after.expiryDate}`,
+      ...result,
+      action: 'check',
+      message: `无需更新。到期日 ${result.expiryDate}, 剩余 ${result.daysLeft} 天`,
     };
   } catch (err) {
     return {
       success: false,
-      action: 'renew_failed',
+      action: 'check_failed',
       error: err.message,
     };
   } finally {
@@ -667,6 +302,6 @@ async function checkAndRenewAccount(account, options = {}) {
 }
 
 module.exports = {
-  checkAndRenewAccount,
+  checkAccount,
   parseExpiry,
 };

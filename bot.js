@@ -4,11 +4,10 @@ const TelegramBot =
 const {
   addAccount,
   getAccounts,
-  getAccount,
   deleteAccount,
   logCheck,
 } = require('./db');
-const { checkAndRenewAccount } = require('./xserver');
+const { checkAccount } = require('./xserver');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null;
@@ -56,52 +55,52 @@ function escapeMarkdown(text) {
 function formatResult(account, result) {
   const name = escapeMarkdown(account.username);
   if (result.success) {
-    if (result.action === 'renewed') {
-      return `✅ *${name}*\n自动续期成功\n${escapeMarkdown(result.previousExpiryDate)} \\-\\> ${escapeMarkdown(result.expiryDate)}`;
-    }
-
     if (result.needsRenewal || result.action === 'needs_renewal') {
-      return `⚠️ *${name}*\n需要续期\n到期日: ${escapeMarkdown(result.expiryDate)}\n剩余: ${result.daysLeft} 天`;
+      return `⚠️ *${name}*\n需要手动更新\n到期日: ${escapeMarkdown(result.expiryDate)}\n剩余: ${result.daysLeft} 天`;
     }
 
-    return `✅ *${name}*\n无需续期\n到期日: ${escapeMarkdown(result.expiryDate)}\n剩余: ${result.daysLeft} 天`;
+    return `✅ *${name}*\n无需更新\n到期日: ${escapeMarkdown(result.expiryDate)}\n剩余: ${result.daysLeft} 天`;
   }
 
   return `❌ *${name}*\n${escapeMarkdown(result.error || result.message || '检测失败')}`;
 }
 
-async function runAccount(account, { renew = true, notifyFailure = false } = {}) {
-  const result = await checkAndRenewAccount(account, { renew });
+async function runAccount(account, { notifyFailure = false } = {}) {
+  const result = await checkAccount(account);
   await logCheck(ADMIN_ID, account, result);
 
   if (notifyFailure && !result.success) {
     await bot.sendMessage(
       ADMIN_ID,
-      `❌ 自动续期/检测失败\n\n账号: ${account.username}\n原因: ${result.error || result.message || '未知错误'}`,
+      `❌ 自动检测失败\n\n账号: ${account.username}\n原因: ${result.error || result.message || '未知错误'}`,
       { disable_web_page_preview: true }
     );
   }
 
-  if (notifyFailure && result.success && result.action === 'renewed') {
+  if (notifyFailure && result.success && (result.needsRenewal || result.action === 'needs_renewal')) {
     await bot.sendMessage(
       ADMIN_ID,
-      `✅ 自动续期成功\n\n账号: ${account.username}\n${result.previousExpiryDate} -> ${result.expiryDate}`
+      `⚠️ 需要手动更新\n\n账号: ${account.username}\n到期日: ${result.expiryDate}\n剩余: ${result.daysLeft} 天`
     );
   }
 
   return result;
 }
 
-async function checkAll({ renew = true, notifyFailure = false } = {}) {
+async function checkAll({ notifyFailure = false } = {}) {
   const accounts = await getAccounts(ADMIN_ID);
   if (!accounts.length) return [];
 
   const results = [];
   for (const account of accounts) {
-    const result = await runAccount(account, { renew, notifyFailure });
+    const result = await runAccount(account, { notifyFailure });
     results.push({ account, result });
   }
   return results;
+}
+
+function shouldNotifyResult(result) {
+  return !result.success || result.needsRenewal || result.action === 'needs_renewal';
 }
 
 function nextJapanSlot(from = new Date()) {
@@ -143,13 +142,11 @@ function scheduleNextAutoCheck() {
     try {
       if (autoJobRunning) return;
       autoJobRunning = true;
-      await bot.sendMessage(ADMIN_ID, '⏱ 自动检测开始。');
-      const results = await checkAll({ renew: true, notifyFailure: true });
-      if (!results.length) {
-        await bot.sendMessage(ADMIN_ID, '自动检测完成：没有保存的账号。');
-      } else {
-        const lines = results.map(({ account, result }) => formatResult(account, result));
-        await bot.sendMessage(ADMIN_ID, `自动检测完成：\n\n${lines.join('\n\n')}`, { parse_mode: 'MarkdownV2' });
+      const results = await checkAll({ notifyFailure: false });
+      const alerts = results.filter(({ result }) => shouldNotifyResult(result));
+      if (alerts.length) {
+        const lines = alerts.map(({ account, result }) => formatResult(account, result));
+        await bot.sendMessage(ADMIN_ID, `自动检测提醒：\n\n${lines.join('\n\n')}`, { parse_mode: 'MarkdownV2' });
       }
     } catch (err) {
       await bot.sendMessage(ADMIN_ID, `❌ 自动检测任务异常: ${err.message}`);
@@ -167,13 +164,13 @@ bot.onText(/\/start/, (msg) => {
     [
       '*renewxserver2*',
       '',
-      'XServer 免费 VPS 自动检测和自动续期机器人。',
+      'XServer 免费 VPS 到期监测和提醒机器人。',
       '每天日本时间 02:00 开始，每 4 小时自动检测一次。',
+      '发现需要手动更新的账号时才会提醒；全部正常则不提醒。',
       '',
       '/add 添加账号',
       '/list 查看账号',
-      '/check 立即检测并自动续期',
-      '/checkonly 只检测不续期',
+      '/check 立即检测',
       '/delete <id> 删除账号',
     ].join('\n'),
     { parse_mode: 'Markdown', reply_markup: menu() }
@@ -184,7 +181,7 @@ bot.onText(/\/help/, (msg) => {
   if (!requireAdmin(msg)) return;
   bot.sendMessage(
     msg.chat.id,
-    '命令：/add、/list、/check、/checkonly、/renew <id>、/delete <id>。自动任务会在日本时间 02:00 起每 4 小时运行。',
+    '命令：/add、/list、/check、/delete <id>。自动任务会在日本时间 02:00 起每 4 小时运行；只有需要手动更新或检测失败时才提醒。',
     { reply_markup: menu() }
   );
 });
@@ -220,9 +217,9 @@ bot.onText(/\/delete\s+(\d+)/, async (msg, match) => {
 
 bot.onText(/\/check$/, async (msg) => {
   if (!requireAdmin(msg)) return;
-  const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号，需要续期时会自动续期...');
+  const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号...');
   try {
-    const results = await checkAll({ renew: true, notifyFailure: true });
+    const results = await checkAll({ notifyFailure: false });
     const text = results.length
       ? results.map(({ account, result }) => formatResult(account, result)).join('\n\n')
       : '还没有账号。使用 /add 添加。';
@@ -237,41 +234,6 @@ bot.onText(/\/check$/, async (msg) => {
       message_id: sent.message_id,
     });
   }
-});
-
-bot.onText(/\/checkonly$/, async (msg) => {
-  if (!requireAdmin(msg)) return;
-  const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号，不会执行续期...');
-  try {
-    const results = await checkAll({ renew: false, notifyFailure: false });
-    const text = results.length
-      ? results.map(({ account, result }) => formatResult(account, result)).join('\n\n')
-      : '还没有账号。使用 /add 添加。';
-    await bot.editMessageText(text, {
-      chat_id: msg.chat.id,
-      message_id: sent.message_id,
-      parse_mode: 'MarkdownV2',
-    });
-  } catch (err) {
-    await bot.editMessageText(`检测失败: ${err.message}`, {
-      chat_id: msg.chat.id,
-      message_id: sent.message_id,
-    });
-  }
-});
-
-bot.onText(/\/renew\s+(\d+)/, async (msg, match) => {
-  if (!requireAdmin(msg)) return;
-  const account = await getAccount(ADMIN_ID, Number(match[1]));
-  if (!account) return bot.sendMessage(msg.chat.id, '没有找到这个账号。', { reply_markup: menu() });
-
-  const sent = await bot.sendMessage(msg.chat.id, `正在检测并自动续期: ${account.username}`);
-  const result = await runAccount(account, { renew: true, notifyFailure: true });
-  await bot.editMessageText(formatResult(account, result), {
-    chat_id: msg.chat.id,
-    message_id: sent.message_id,
-    parse_mode: 'MarkdownV2',
-  });
 });
 
 bot.on('message', async (msg) => {
@@ -284,9 +246,9 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(msg.chat.id, '请输入 XServer 登录账号：', { reply_markup: { force_reply: true } });
   }
   if (text === '立即检测') {
-    const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号，需要续期时会自动续期...');
+    const sent = await bot.sendMessage(msg.chat.id, '正在检测所有账号...');
     try {
-      const results = await checkAll({ renew: true, notifyFailure: true });
+      const results = await checkAll({ notifyFailure: false });
       const reply = results.length
         ? results.map(({ account, result }) => formatResult(account, result)).join('\n\n')
         : '还没有账号。使用 /add 添加。';
@@ -305,7 +267,7 @@ bot.on('message', async (msg) => {
   if (text === '帮助') {
     return bot.sendMessage(
       msg.chat.id,
-      '命令：/add、/list、/check、/checkonly、/renew <id>、/delete <id>。自动任务会在日本时间 02:00 起每 4 小时运行。',
+      '命令：/add、/list、/check、/delete <id>。自动任务会在日本时间 02:00 起每 4 小时运行；只有需要手动更新或检测失败时才提醒。',
       { reply_markup: menu() }
     );
   }
@@ -353,7 +315,7 @@ scheduleNextAutoCheck();
 
 if (RUN_ON_START) {
   setTimeout(() => {
-    checkAll({ renew: true, notifyFailure: true }).catch((err) => {
+    checkAll({ notifyFailure: true }).catch((err) => {
       console.error('Startup check failed:', err);
     });
   }, 15000);
