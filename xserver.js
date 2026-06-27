@@ -248,6 +248,19 @@ async function extractFreeVpsDetailFromPage(page) {
 
 async function solveCaptchaInPage(page) {
   return page.evaluate(async (modelUrl) => {
+    function setNativeValue(input, value) {
+      input.focus();
+      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value');
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(input, value);
+      } else {
+        input.value = value;
+      }
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+    }
+
     function loadScript(src) {
       return new Promise((resolve, reject) => {
         if (window.tf) return resolve();
@@ -293,15 +306,58 @@ async function solveCaptchaInPage(page) {
       document.querySelector('input[name*="captcha"], input[placeholder*="画像"], input[type="text"]');
     if (!input) throw new Error('找不到验证码输入框');
 
-    input.value = code;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
+    setNativeValue(input, code);
     return code;
   }, CAPTCHA_MODEL_URL);
 }
 
+async function clickTurnstileIfPresent(page) {
+  const frameSelectors = [
+    'iframe[src*="turnstile"]',
+    'iframe[title*="Cloudflare"]',
+    'iframe[title*="Widget"]',
+    'iframe[src*="challenges.cloudflare.com"]',
+  ];
+  const controlSelectors = [
+    'input[type="checkbox"]',
+    '[role="checkbox"]',
+    'label',
+    '.ctp-checkbox-label',
+    '#challenge-stage',
+    'body',
+  ];
+
+  for (const frameSelector of frameSelectors) {
+    const frameLocator = page.frameLocator(frameSelector).first();
+    for (const controlSelector of controlSelectors) {
+      try {
+        const control = frameLocator.locator(controlSelector).first();
+        if (!(await control.count().catch(() => 0))) continue;
+        await control.click({ timeout: 2500 });
+        return true;
+      } catch (_) {
+        // Try the next Turnstile target.
+      }
+    }
+
+    try {
+      const iframe = page.locator(frameSelector).first();
+      if (!(await iframe.count().catch(() => 0))) continue;
+      const box = await iframe.boundingBox();
+      if (!box) continue;
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      return true;
+    } catch (_) {
+      // Try the next iframe candidate.
+    }
+  }
+
+  return false;
+}
+
 async function waitForTurnstile(page, timeoutMs = 90000) {
   const started = Date.now();
+  let lastClickAt = 0;
   while (Date.now() - started < timeoutMs) {
     const status = await page.evaluate(() => {
       const fields = [...document.querySelectorAll('[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')];
@@ -314,6 +370,10 @@ async function waitForTurnstile(page, timeoutMs = 90000) {
     }).catch(() => 'missing');
 
     if (status === 'missing' || status === 'ready') return status;
+    if (Date.now() - lastClickAt > 5000) {
+      await clickTurnstileIfPresent(page);
+      lastClickAt = Date.now();
+    }
     await sleep(1000);
   }
   throw new Error('Cloudflare Turnstile 未在超时时间内完成');
