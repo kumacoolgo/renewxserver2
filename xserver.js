@@ -365,7 +365,7 @@ async function waitForTurnstile(page, timeoutMs = 90000) {
       const hasToken = fields.some((field) => String(field.value || '').trim().length > 0);
       const submitEnabled = submit && !submit.disabled && !submit.classList.contains('btn--disabled');
 
-      if (!fields.length) return 'missing';
+      if (!fields.length && submitEnabled) return 'missing';
       return hasToken ? 'ready' : 'waiting';
     }).catch(() => 'missing');
 
@@ -379,9 +379,58 @@ async function waitForTurnstile(page, timeoutMs = 90000) {
   throw new Error('Cloudflare Turnstile 未在超时时间内完成');
 }
 
+async function getFinalSubmitState(page) {
+  return page.evaluate(() => {
+    const submit = document.querySelector('#submit_button, [formaction="/xapanel/xvps/server/freevps/extend/do"]');
+    const captchaInput = document.querySelector('[placeholder*="上の画像"], input[name*="captcha"], input[type="text"]');
+    const fields = [...document.querySelectorAll('[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')];
+    const turnstileFrames = document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]').length;
+    const tokenLengths = fields.map((field) => String(field.value || '').trim().length);
+
+    return {
+      exists: Boolean(submit),
+      disabled: submit ? Boolean(submit.disabled) : null,
+      className: submit ? String(submit.className || '') : '',
+      text: submit ? String(submit.textContent || submit.value || '').trim() : '',
+      captchaLength: captchaInput ? String(captchaInput.value || '').trim().length : null,
+      tokenLengths,
+      turnstileFrames,
+      url: location.href,
+    };
+  }).catch((err) => ({ error: err.message }));
+}
+
+async function waitForFinalSubmitReady(page, timeoutMs = 30000) {
+  const started = Date.now();
+  let lastClickAt = 0;
+
+  while (Date.now() - started < timeoutMs) {
+    const state = await getFinalSubmitState(page);
+    const enabled =
+      state.exists &&
+      !state.disabled &&
+      !String(state.className || '').includes('btn--disabled') &&
+      !String(state.className || '').includes('disabled');
+
+    if (enabled) return state;
+
+    if (Date.now() - lastClickAt > 5000) {
+      await clickTurnstileIfPresent(page);
+      lastClickAt = Date.now();
+    }
+    await sleep(1000);
+  }
+
+  const state = await getFinalSubmitState(page);
+  throw new Error(`最终续期提交按钮不可点击: ${JSON.stringify(state)}`);
+}
+
 async function submitRenewalFinal(page) {
   await waitForTurnstile(page);
+  await waitForFinalSubmitReady(page);
   const clicked = await clickFirst(page, [
+    '[formaction="/xapanel/xvps/server/freevps/extend/do"]',
+    '#submit_button',
     'text=無料VPSの利用を継続する',
     'button:has-text("無料VPS")',
     'input[type="submit"]',
