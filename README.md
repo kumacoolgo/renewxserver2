@@ -52,6 +52,9 @@ BROWSER_HEADLESS=false
 BROWSER_TIMEZONE=Asia/Tokyo
 BROWSER_LOCALE=ja-JP
 RENEWAL_THRESHOLD_DAYS=1
+CHECK_LOG_RETENTION_DAYS=90
+CHECK_LOG_MAX_ROWS=2000
+CLEAR_PROFILE_CACHE=true
 RUN_ON_START=false
 ```
 
@@ -71,6 +74,16 @@ CLOAKBROWSER_LICENSE_KEY=cb_xxxxxxxx
 ```
 
 The Docker image runs CloakBrowser in headed mode through Xvfb. The first run downloads the CloakBrowser Chromium binary into `CLOAKBROWSER_CACHE_DIR`. Keeping `/data` mounted avoids downloading it again after every redeploy.
+
+## Disk Usage
+
+Persistent data is stored under `/data`:
+
+- `/data/accounts.db` stores accounts and recent check logs.
+- `/data/profiles` stores one browser profile per XServer account so login cookies can be reused.
+- `/data/.cloakbrowser` stores the CloakBrowser Chromium binary cache.
+
+To avoid unbounded growth, check logs are pruned after each check. Defaults are `CHECK_LOG_RETENTION_DAYS=90` and `CHECK_LOG_MAX_ROWS=2000`. Browser cache folders inside each profile are also cleaned after checks by default with `CLEAR_PROFILE_CACHE=true`; cookies and local storage are kept.
 
 ## Local Development
 

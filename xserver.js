@@ -12,6 +12,7 @@ const BROWSER_GEOIP =
   process.env.BROWSER_GEOIP == null ? Boolean(BROWSER_PROXY) : process.env.BROWSER_GEOIP === 'true';
 const BROWSER_TIMEZONE = process.env.BROWSER_TIMEZONE || 'Asia/Tokyo';
 const BROWSER_LOCALE = process.env.BROWSER_LOCALE || 'ja-JP';
+const CLEAR_PROFILE_CACHE = process.env.CLEAR_PROFILE_CACHE !== 'false';
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -27,6 +28,27 @@ function fingerprintSeed(value) {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
+}
+
+function cleanupProfileCache(userDataDir) {
+  if (!CLEAR_PROFILE_CACHE) return;
+
+  const cachePaths = [
+    path.join(userDataDir, 'Default', 'Cache'),
+    path.join(userDataDir, 'Default', 'Code Cache'),
+    path.join(userDataDir, 'Default', 'GPUCache'),
+    path.join(userDataDir, 'Default', 'Service Worker', 'CacheStorage'),
+    path.join(userDataDir, 'GrShaderCache'),
+    path.join(userDataDir, 'ShaderCache'),
+  ];
+
+  for (const target of cachePaths) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+    } catch (_) {
+      // Cache cleanup is best-effort; cookies and local storage are left intact.
+    }
+  }
 }
 
 function parseExpiry(text) {
@@ -271,6 +293,7 @@ async function extractFreeVpsDetailFromPage(page) {
 async function checkAccount(account) {
   const context = await launchAccountContext(account);
   const page = context.pages()[0] || await context.newPage();
+  const userDataDir = path.join(PROFILE_DIR, `${account.id}-${safeName(account.username)}`);
 
   try {
     await ensureLoggedIn(page, account);
@@ -298,6 +321,7 @@ async function checkAccount(account) {
     };
   } finally {
     await context.close().catch(() => {});
+    cleanupProfileCache(userDataDir);
   }
 }
 

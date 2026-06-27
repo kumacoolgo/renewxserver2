@@ -3,6 +3,8 @@ const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 
 const DB_PATH = process.env.DB_PATH || '/data/accounts.db';
+const CHECK_LOG_RETENTION_DAYS = Number(process.env.CHECK_LOG_RETENTION_DAYS || 90);
+const CHECK_LOG_MAX_ROWS = Number(process.env.CHECK_LOG_MAX_ROWS || 2000);
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
@@ -96,7 +98,7 @@ async function deleteAccount(userId, accountId) {
 }
 
 async function logCheck(userId, account, result) {
-  return run(
+  const saved = await run(
     `
       INSERT INTO check_log
         (user_id, account_id, username, success, action, expiry_date, days_left, message)
@@ -113,6 +115,30 @@ async function logCheck(userId, account, result) {
       result.message || result.error || null,
     ]
   );
+  await cleanupCheckLogs();
+  return saved;
+}
+
+async function cleanupCheckLogs() {
+  if (Number.isFinite(CHECK_LOG_RETENTION_DAYS) && CHECK_LOG_RETENTION_DAYS > 0) {
+    await run("DELETE FROM check_log WHERE checked_at < datetime('now', ?)", [
+      `-${Math.floor(CHECK_LOG_RETENTION_DAYS)} days`,
+    ]);
+  }
+
+  if (Number.isFinite(CHECK_LOG_MAX_ROWS) && CHECK_LOG_MAX_ROWS > 0) {
+    await run(
+      `
+        DELETE FROM check_log
+        WHERE id NOT IN (
+          SELECT id FROM check_log
+          ORDER BY checked_at DESC, id DESC
+          LIMIT ?
+        )
+      `,
+      [Math.floor(CHECK_LOG_MAX_ROWS)]
+    );
+  }
 }
 
 module.exports = {
