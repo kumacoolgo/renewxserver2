@@ -7,6 +7,11 @@ const DATA_DIR = process.env.DATA_DIR || '/data';
 const PROFILE_DIR = process.env.PROFILE_DIR || path.join(DATA_DIR, 'profiles');
 const RENEWAL_THRESHOLD_DAYS = Number(process.env.RENEWAL_THRESHOLD_DAYS || 1);
 const HEADLESS = process.env.BROWSER_HEADLESS !== 'false';
+const BROWSER_PROXY = process.env.CLOAKBROWSER_PROXY || process.env.BROWSER_PROXY_SERVER || '';
+const BROWSER_GEOIP =
+  process.env.BROWSER_GEOIP == null ? Boolean(BROWSER_PROXY) : process.env.BROWSER_GEOIP === 'true';
+const BROWSER_TIMEZONE = process.env.BROWSER_TIMEZONE || 'Asia/Tokyo';
+const BROWSER_LOCALE = process.env.BROWSER_LOCALE || 'ja-JP';
 const CAPTCHA_MODEL_URL =
   process.env.CAPTCHA_MODEL_URL ||
   'https://github30.github.io/captcha-cloudrun/web_model/model.json?v=20260407-2';
@@ -17,6 +22,15 @@ function sleep(ms) {
 
 function safeName(value) {
   return String(value).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 80);
+}
+
+function fingerprintSeed(value) {
+  let hash = 2166136261;
+  for (const char of String(value)) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
 }
 
 function parseExpiry(text) {
@@ -49,21 +63,27 @@ async function launchAccountContext(account) {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
   const { launchPersistentContext } = await import('cloakbrowser');
   const userDataDir = path.join(PROFILE_DIR, `${account.id}-${safeName(account.username)}`);
-
-  return launchPersistentContext({
+  const args = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    `--lang=${BROWSER_LOCALE}`,
+    `--fingerprint=${fingerprintSeed(account.username)}`,
+  ];
+  const options = {
     userDataDir,
     headless: HEADLESS,
     humanize: true,
-    timezone: 'Asia/Tokyo',
-    locale: 'ja-JP',
+    geoip: BROWSER_GEOIP,
+    timezone: BROWSER_TIMEZONE,
+    locale: BROWSER_LOCALE,
     viewport: { width: 1366, height: 900 },
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--lang=ja-JP',
-    ],
-  });
+    args,
+  };
+
+  if (BROWSER_PROXY) options.proxy = BROWSER_PROXY;
+
+  return launchPersistentContext(options);
 }
 
 async function clickFirst(page, selectors, timeout = 8000) {
@@ -83,9 +103,15 @@ async function clickFirst(page, selectors, timeout = 8000) {
 
 async function login(page, username, password) {
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.locator('#memberid, input[name="memberid"]').first().waitFor({ timeout: 30000 });
-  await page.locator('#memberid, input[name="memberid"]').first().fill(username);
-  await page.locator('#user_password, input[name="user_password"]').first().fill(password);
+  const usernameInput = page.locator('#memberid, input[name="memberid"]').first();
+  const passwordInput = page.locator('#user_password, input[name="user_password"]').first();
+  await usernameInput.waitFor({ timeout: 30000 });
+  await usernameInput.click({ timeout: 10000 });
+  await usernameInput.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
+  await usernameInput.type(username, { delay: 45 });
+  await passwordInput.click({ timeout: 10000 });
+  await passwordInput.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
+  await passwordInput.type(password, { delay: 55 });
 
   const clicked = await clickFirst(page, [
     'input[name="action_user_login"]',
@@ -303,6 +329,7 @@ async function solveCaptchaInPage(page) {
     });
 
     const input =
+      document.querySelector('[placeholder*="上の画像"]') ||
       document.querySelector('input[name*="captcha"], input[placeholder*="画像"], input[type="text"]');
     if (!input) throw new Error('找不到验证码输入框');
 
@@ -425,20 +452,52 @@ async function waitForFinalSubmitReady(page, timeoutMs = 30000) {
   throw new Error(`最终续期提交按钮不可点击: ${JSON.stringify(state)}`);
 }
 
+async function clickFinalSubmitInPage(page) {
+  return page.evaluate(() => {
+    const submitBtn =
+      [...document.querySelectorAll('button, input[type="submit"], a')].find((el) =>
+        String(el.textContent || el.value || '').includes('無料VPSの利用を継続する')
+      ) ||
+      document.querySelector('[formaction="/xapanel/xvps/server/freevps/extend/do"]') ||
+      document.querySelector('#submit_button') ||
+      document.querySelector('input[type="submit"], button[type="submit"]');
+
+    if (!submitBtn) {
+      return {
+        clicked: false,
+        reason: '找不到提交按钮',
+        url: location.href,
+        text: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      };
+    }
+
+    if (submitBtn.disabled || String(submitBtn.className || '').includes('btn--disabled')) {
+      return {
+        clicked: false,
+        reason: '提交按钮不可点击',
+        disabled: Boolean(submitBtn.disabled),
+        className: String(submitBtn.className || ''),
+        url: location.href,
+      };
+    }
+
+    submitBtn.click();
+    return {
+      clicked: true,
+      text: String(submitBtn.textContent || submitBtn.value || '').trim(),
+      url: location.href,
+    };
+  });
+}
+
 async function submitRenewalFinal(page) {
   await waitForTurnstile(page);
   await waitForFinalSubmitReady(page);
-  const clicked = await clickFirst(page, [
-    '[formaction="/xapanel/xvps/server/freevps/extend/do"]',
-    '#submit_button',
-    'text=無料VPSの利用を継続する',
-    'button:has-text("無料VPS")',
-    'input[type="submit"]',
-    'button[type="submit"]',
-  ], 12000);
+  await sleep(1000);
+  const clickResult = await clickFinalSubmitInPage(page);
 
-  if (!clicked) {
-    throw new Error('找不到最终续期提交按钮');
+  if (!clickResult.clicked) {
+    throw new Error(`找不到最终续期提交按钮: ${JSON.stringify(clickResult)}`);
   }
 
   await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});

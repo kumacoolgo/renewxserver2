@@ -51,9 +51,20 @@ DATA_DIR=/data
 PROFILE_DIR=/data/profiles
 CLOAKBROWSER_CACHE_DIR=/data/.cloakbrowser
 BROWSER_HEADLESS=false
+BROWSER_TIMEZONE=Asia/Tokyo
+BROWSER_LOCALE=ja-JP
 RENEWAL_THRESHOLD_DAYS=1
 RUN_ON_START=false
 ```
+
+Recommended for Zeabur or other datacenter hosting:
+
+```env
+CLOAKBROWSER_PROXY=http://user:pass@residential-proxy-host:port
+BROWSER_GEOIP=true
+```
+
+`CLOAKBROWSER_PROXY` also accepts `socks5://user:pass@host:port`. Cloudflare may give datacenter IPs a stricter Turnstile challenge or no token at all. CloakBrowser improves the browser fingerprint and interaction environment, but it is not a CAPTCHA-solving service or an IP reputation replacement. The XServer image CAPTCHA is still handled separately with the TFJS model from the original userscript flow.
 
 Optional CloakBrowser Pro:
 
