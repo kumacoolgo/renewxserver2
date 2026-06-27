@@ -328,7 +328,7 @@ async function clickTurnstileIfPresent(page) {
   ];
 
   for (const frameSelector of frameSelectors) {
-    const frameLocator = page.frameLocator(frameSelector).first();
+    const frameLocator = page.frameLocator(frameSelector);
     for (const controlSelector of controlSelectors) {
       try {
         const control = frameLocator.locator(controlSelector).first();
@@ -366,7 +366,7 @@ async function waitForTurnstile(page, timeoutMs = 90000) {
       const submitEnabled = submit && !submit.disabled && !submit.classList.contains('btn--disabled');
 
       if (!fields.length) return 'missing';
-      return hasToken || submitEnabled ? 'ready' : 'waiting';
+      return hasToken ? 'ready' : 'waiting';
     }).catch(() => 'missing');
 
     if (status === 'missing' || status === 'ready') return status;
@@ -394,6 +394,64 @@ async function submitRenewalFinal(page) {
 
   await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
   await sleep(3000);
+
+  const problem = await getRenewalSubmitProblem(page);
+  if (problem) throw new Error(problem);
+}
+
+async function getRenewalSubmitProblem(page) {
+  return page.evaluate(() => {
+    const isVerificationPage =
+      location.pathname.includes('/xapanel/xvps/server/freevps/extend/conf') ||
+      location.pathname.includes('/xapanel/xvps/server/freevps/extend/do');
+    if (!isVerificationPage) return '';
+
+    const captchaImage = document.querySelector('img[src^="data:image"], img[src^="data:"]');
+    const captchaInput = document.querySelector('[placeholder*="上の画像"], input[name*="captcha"], input[type="text"]');
+    const submit = document.querySelector('#submit_button, [formaction="/xapanel/xvps/server/freevps/extend/do"]');
+    if (!captchaImage || !captchaInput || !submit) return '';
+
+    const bodyText = (document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+    return `续期提交后仍停留在验证码页面，可能是验证码或 Turnstile 未通过。URL: ${location.href}; 页面: ${bodyText.slice(0, 260)}`;
+  }).catch(() => '');
+}
+
+async function solveCaptchaAndSubmitRenewal(page) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const hasCaptcha = await page.locator('img[src^="data:image"], img[src^="data:"]').count().catch(() => 0);
+      if (hasCaptcha > 0) {
+        let solved = false;
+        for (let i = 0; i < 3; i += 1) {
+          try {
+            const code = await solveCaptchaInPage(page);
+            if (!code || String(code).length < 4) throw new Error(`验证码识别结果异常: ${code || '(empty)'}`);
+            solved = true;
+            break;
+          } catch (err) {
+            lastError = err;
+            await sleep(1000);
+          }
+        }
+        if (!solved) throw lastError || new Error('验证码识别失败');
+      }
+
+      await submitRenewalFinal(page);
+      return;
+    } catch (err) {
+      lastError = err;
+      const canRetry =
+        String(err.message || '').includes('验证码') ||
+        String(err.message || '').includes('Turnstile');
+      if (!canRetry || attempt >= 3) throw err;
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await sleep(3000);
+    }
+  }
+
+  throw lastError || new Error('续期提交失败');
 }
 
 async function renewFreeVps(page, info) {
@@ -434,24 +492,7 @@ async function renewFreeVps(page, info) {
   await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
   await sleep(2500);
 
-  const hasCaptcha = await page.locator('img[src^="data:image"], img[src^="data:"]').count().catch(() => 0);
-  if (hasCaptcha > 0) {
-    let solved = false;
-    let lastError = null;
-    for (let i = 0; i < 3; i += 1) {
-      try {
-        await solveCaptchaInPage(page);
-        solved = true;
-        break;
-      } catch (err) {
-        lastError = err;
-        await sleep(1000);
-      }
-    }
-    if (!solved) throw lastError || new Error('验证码识别失败');
-  }
-
-  await submitRenewalFinal(page);
+  await solveCaptchaAndSubmitRenewal(page);
 }
 
 async function checkAndRenewAccount(account, options = {}) {
